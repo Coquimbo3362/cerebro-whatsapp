@@ -5,7 +5,6 @@ import time
 import traceback
 import re
 from flask import Flask, request
-# Importamos el Cliente para enviar mensajes activos
 from twilio.rest import Client as TwilioClient 
 from twilio.twiml.messaging_response import MessagingResponse
 from supabase import create_client, Client
@@ -29,7 +28,6 @@ app = Flask(__name__)
 try:
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
     client = genai.Client(api_key=GOOGLE_KEY)
-    # Cliente para enviar mensajes activos
     twilio_client = TwilioClient(TWILIO_SID, TWILIO_TOKEN) 
     MODELO_IA = 'gemini-2.5-flash'
 except Exception as e:
@@ -54,14 +52,15 @@ def optimizar_imagen(imagen_bytes):
 
 RUBROS_VALIDOS = "Almacén, Bebidas, Carnicería, Verdulería, Lácteos, Limpieza, Otros"
 
-def procesar_imagen_con_ia(imagen_bytes):
-    image_pil = optimizar_imagen(imagen_bytes)
+def procesar_ticket_ia(lista_imagenes_pil):
+    # Armamos el contenido: Prompt + Todas las imágenes
+    contenidos = []
     
     prompt = f"""
-    Lee este ticket.
+    Analiza estas imágenes que son PARTES DE UN MISMO TICKET (únelas lógicamente).
     1. Supermercado y Sucursal.
     2. Total Pagado.
-    3. LISTA DE PRODUCTOS: Nombre, Cantidad, Precio Unitario.
+    3. LISTA COMPLETA DE PRODUCTOS: Nombre, Cantidad, Precio Unitario.
     Rubros: {RUBROS_VALIDOS}.
     
     JSON: {{
@@ -73,10 +72,15 @@ def procesar_imagen_con_ia(imagen_bytes):
         ]
     }}
     """
+    contenidos.append(prompt)
+    
+    # Agregamos cada imagen a la lista de contenidos
+    for img in lista_imagenes_pil:
+        contenidos.append(img)
     
     response = client.models.generate_content(
         model=MODELO_IA,
-        contents=[prompt, image_pil],
+        contents=contenidos,
         config=types.GenerateContentConfig(response_mime_type='application/json')
     )
     return json.loads(response.text)
@@ -93,9 +97,9 @@ def guardar_ticket(data, user_id):
         "user_id": user_id,
         "supermercado_id": super_id,
         "fecha": limpiar_fecha(data.get('fecha')),
-        "hora": "12:00:00",
+        "hora": time.strftime("%H:%M:%S"),
         "monto_total": data.get('total_pagado', 0),
-        "imagen_url": "whatsapp_bot"
+        "imagen_url": "whatsapp_multifoto"
     }
     res_ticket = supabase.table('tickets').insert(ticket_data).execute()
     ticket_id = res_ticket.data[0]['id']
@@ -118,52 +122,48 @@ def guardar_ticket(data, user_id):
         return len(items_db)
     return 0
 
-# --- FUNCIÓN DE ENVÍO ACTIVO ---
 def enviar_whatsapp(to_number, body_text):
-    """Envía un mensaje nuevo, no responde al anterior"""
     try:
-        # El número 'from_' es el del Sandbox de Twilio (generalmente fijo)
-        # Lo sacamos de la variable de entorno o usamos el estándar
         twilio_client.messages.create(
             from_='whatsapp:+14155238886', 
             body=body_text,
             to=f'whatsapp:{to_number}'
         )
-        print("📤 Mensaje de confirmación enviado.")
     except Exception as e:
-        print(f"❌ Error enviando WhatsApp: {e}")
+        print(f"Error enviando WA: {e}")
 
 # --- WEBHOOK ---
 @app.route("/whatsapp", methods=['POST'])
 def whatsapp_webhook():
-    # Respondemos vacío rápido para que WhatsApp no de timeout
-    # Usaremos el envío activo para contestar de verdad
-    
     try:
         sender = request.form.get('From')
-        media_url = request.form.get('MediaUrl0')
+        num_media = int(request.form.get('NumMedia', 0)) # Cantidad de fotos
         telefono_usuario = sender.replace("whatsapp:", "")
         
-        print(f"1. Procesando para: {telefono_usuario}")
+        print(f"1. Mensaje de {telefono_usuario}. Fotos adjuntas: {num_media}")
 
         # Identificar Usuario
         res = supabase.table('perfiles').select("id").eq('telefono', telefono_usuario).execute()
         if not res.data:
-            enviar_whatsapp(telefono_usuario, "⛔ No te reconozco. Regístrate en la web primero.")
-            return str(MessagingResponse()) # Fin
+            enviar_whatsapp(telefono_usuario, "⛔ Regístrate primero en la web.")
+            return str(MessagingResponse())
         
         user_id = res.data[0]['id']
 
-        if media_url:
-            # Avisamos que empezamos (opcional)
-            # enviar_whatsapp(telefono_usuario, "⏳ Procesando foto...")
+        if num_media > 0:
+            print(f"2. Descargando {num_media} imágenes...")
+            lista_imagenes = []
             
-            print("2. Descargando...")
-            r = requests.get(media_url, auth=(TWILIO_SID, TWILIO_TOKEN))
+            # Iteramos por todas las fotos que mandó (MediaUrl0, MediaUrl1, etc)
+            for i in range(num_media):
+                url = request.form.get(f'MediaUrl{i}')
+                r = requests.get(url, auth=(TWILIO_SID, TWILIO_TOKEN))
+                if r.status_code == 200:
+                    lista_imagenes.append(optimizar_imagen(r.content))
             
-            if r.status_code == 200:
-                print("3. Analizando con IA...")
-                datos = procesar_imagen_con_ia(r.content)
+            if lista_imagenes:
+                print("3. Enviando lote a IA...")
+                datos = procesar_ticket_ia(lista_imagenes)
                 
                 if datos:
                     print("4. Guardando...")
@@ -171,23 +171,20 @@ def whatsapp_webhook():
                     total = datos.get('total_pagado')
                     
                     if cant > 0:
-                        print("5. ¡ÉXITO!")
-                        # AQUÍ ENVIAMOS EL MENSAJE FINAL ACTIVAMENTE
-                        enviar_whatsapp(telefono_usuario, f"✅ *Guardado*\n📍 {datos.get('supermercado')}\n💰 ${total}\n🛒 {cant} items")
+                        enviar_whatsapp(telefono_usuario, f"✅ *Guardado (Multifoto)*\n📍 {datos.get('supermercado')}\n💰 ${total}\n🛒 {cant} items")
                     else:
-                        enviar_whatsapp(telefono_usuario, "⚠️ Ticket guardado pero vacío.")
+                        enviar_whatsapp(telefono_usuario, "⚠️ Ticket vacío.")
                 else:
-                    enviar_whatsapp(telefono_usuario, "❌ La IA no pudo leer el ticket.")
+                    enviar_whatsapp(telefono_usuario, "❌ La IA no pudo unir las fotos.")
             else:
-                enviar_whatsapp(telefono_usuario, "❌ Error descargando imagen.")
+                enviar_whatsapp(telefono_usuario, "❌ Error descargando imágenes.")
         else:
-            enviar_whatsapp(telefono_usuario, "📸 Mándame una foto del ticket.")
+            enviar_whatsapp(telefono_usuario, "📸 Envíame fotos del ticket.")
 
     except Exception as e:
         print(f"🔴 ERROR: {e}")
         traceback.print_exc()
 
-    # Retornamos respuesta vacía al servidor de WhatsApp para cumplir protocolo
     return str(MessagingResponse())
 
 if __name__ == "__main__":
