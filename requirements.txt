@@ -1,0 +1,8 @@
+flask
+twilio
+requests
+google-genai
+supabase
+python-dotenv
+gunicorn
+Pillow
