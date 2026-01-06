@@ -45,23 +45,36 @@ def limpiar_fecha(fecha_str):
     return fecha_str if fecha_str and len(fecha_str) == 10 else time.strftime("%Y-%m-%d")
 
 def optimizar_imagen(imagen_bytes):
-    img = Image.open(io.BytesIO(imagen_bytes))
-    if img.width > 1024 or img.height > 1024:
-        img.thumbnail((1024, 1024))
-    return img
+    try:
+        img = Image.open(io.BytesIO(imagen_bytes))
+        if img.width > 1024 or img.height > 1024:
+            img.thumbnail((1024, 1024))
+        img_byte_arr = io.BytesIO()
+        img.save(img_byte_arr, format=img.format)
+        return img_byte_arr.getvalue()
+    except:
+        return imagen_bytes
 
-RUBROS_VALIDOS = "Almacén, Bebidas, Carnicería, Verdulería, Lácteos, Limpieza, Otros"
+# --- LISTA DE RUBROS ACTUALIZADA (Con Farmacia) ---
+RUBROS_VALIDOS = """
+Almacén, Bebidas, Carnicería, Verdulería, Lácteos, Limpieza, 
+Perfumería, Farmacia, Mascotas, Indumentaria, Electro, Otros
+"""
 
-def procesar_ticket_ia(lista_imagenes_pil):
-    # Armamos el contenido: Prompt + Todas las imágenes
-    contenidos = []
+def procesar_archivo_ia(contenido_bytes, tipo_mime):
+    # Si es imagen, la optimizamos. Si es PDF, va crudo.
+    datos_para_enviar = contenido_bytes
+    if "image" in tipo_mime:
+        datos_para_enviar = optimizar_imagen(contenido_bytes)
     
     prompt = f"""
-    Analiza estas imágenes que son PARTES DE UN MISMO TICKET (únelas lógicamente).
-    1. Supermercado y Sucursal.
+    Lee este ticket o factura.
+    1. Comercio y Sucursal.
     2. Total Pagado.
-    3. LISTA COMPLETA DE PRODUCTOS: Nombre, Cantidad, Precio Unitario.
-    Rubros: {RUBROS_VALIDOS}.
+    3. LISTA DE PRODUCTOS: Nombre, Cantidad, Precio Unitario.
+    
+    IMPORTANTE: Clasifica cada item usando estos Rubros: {RUBROS_VALIDOS}.
+    Si son remedios, usa "Farmacia".
     
     JSON: {{
         'supermercado': 'str', 
@@ -72,15 +85,15 @@ def procesar_ticket_ia(lista_imagenes_pil):
         ]
     }}
     """
-    contenidos.append(prompt)
     
-    # Agregamos cada imagen a la lista de contenidos
-    for img in lista_imagenes_pil:
-        contenidos.append(img)
+    archivo_part = types.Part.from_bytes(
+        data=datos_para_enviar,
+        mime_type=tipo_mime
+    )
     
     response = client.models.generate_content(
         model=MODELO_IA,
-        contents=contenidos,
+        contents=[prompt, archivo_part],
         config=types.GenerateContentConfig(response_mime_type='application/json')
     )
     return json.loads(response.text)
@@ -99,7 +112,7 @@ def guardar_ticket(data, user_id):
         "fecha": limpiar_fecha(data.get('fecha')),
         "hora": time.strftime("%H:%M:%S"),
         "monto_total": data.get('total_pagado', 0),
-        "imagen_url": "whatsapp_multifoto"
+        "imagen_url": "whatsapp_doc"
     }
     res_ticket = supabase.table('tickets').insert(ticket_data).execute()
     ticket_id = res_ticket.data[0]['id']
@@ -132,17 +145,16 @@ def enviar_whatsapp(to_number, body_text):
     except Exception as e:
         print(f"Error enviando WA: {e}")
 
-# --- WEBHOOK ---
 @app.route("/whatsapp", methods=['POST'])
 def whatsapp_webhook():
     try:
         sender = request.form.get('From')
-        num_media = int(request.form.get('NumMedia', 0)) # Cantidad de fotos
+        media_url = request.form.get('MediaUrl0')
+        content_type = request.form.get('MediaContentType0') 
         telefono_usuario = sender.replace("whatsapp:", "")
         
-        print(f"1. Mensaje de {telefono_usuario}. Fotos adjuntas: {num_media}")
+        print(f"1. Mensaje de {telefono_usuario}. Tipo: {content_type}")
 
-        # Identificar Usuario
         res = supabase.table('perfiles').select("id").eq('telefono', telefono_usuario).execute()
         if not res.data:
             enviar_whatsapp(telefono_usuario, "⛔ Regístrate primero en la web.")
@@ -150,20 +162,13 @@ def whatsapp_webhook():
         
         user_id = res.data[0]['id']
 
-        if num_media > 0:
-            print(f"2. Descargando {num_media} imágenes...")
-            lista_imagenes = []
+        if media_url:
+            print(f"2. Descargando {content_type}...")
+            r = requests.get(media_url, auth=(TWILIO_SID, TWILIO_TOKEN))
             
-            # Iteramos por todas las fotos que mandó (MediaUrl0, MediaUrl1, etc)
-            for i in range(num_media):
-                url = request.form.get(f'MediaUrl{i}')
-                r = requests.get(url, auth=(TWILIO_SID, TWILIO_TOKEN))
-                if r.status_code == 200:
-                    lista_imagenes.append(optimizar_imagen(r.content))
-            
-            if lista_imagenes:
-                print("3. Enviando lote a IA...")
-                datos = procesar_ticket_ia(lista_imagenes)
+            if r.status_code == 200:
+                print("3. Analizando con IA...")
+                datos = procesar_archivo_ia(r.content, content_type)
                 
                 if datos:
                     print("4. Guardando...")
@@ -171,15 +176,16 @@ def whatsapp_webhook():
                     total = datos.get('total_pagado')
                     
                     if cant > 0:
-                        enviar_whatsapp(telefono_usuario, f"✅ *Guardado (Multifoto)*\n📍 {datos.get('supermercado')}\n💰 ${total}\n🛒 {cant} items")
+                        tipo_doc = "PDF" if "pdf" in content_type else "Foto"
+                        enviar_whatsapp(telefono_usuario, f"✅ *Guardado ({tipo_doc})*\n📍 {datos.get('supermercado')}\n💰 ${total}\n🛒 {cant} items")
                     else:
-                        enviar_whatsapp(telefono_usuario, "⚠️ Ticket vacío.")
+                        enviar_whatsapp(telefono_usuario, "⚠️ Archivo leído pero sin items.")
                 else:
-                    enviar_whatsapp(telefono_usuario, "❌ La IA no pudo unir las fotos.")
+                    enviar_whatsapp(telefono_usuario, "❌ La IA no pudo leer el archivo.")
             else:
-                enviar_whatsapp(telefono_usuario, "❌ Error descargando imágenes.")
+                enviar_whatsapp(telefono_usuario, "❌ Error descargando archivo.")
         else:
-            enviar_whatsapp(telefono_usuario, "📸 Envíame fotos del ticket.")
+            enviar_whatsapp(telefono_usuario, "📸 Envíame una foto o un PDF.")
 
     except Exception as e:
         print(f"🔴 ERROR: {e}")
