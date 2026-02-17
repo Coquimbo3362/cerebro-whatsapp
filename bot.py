@@ -45,10 +45,19 @@ def limpiar_fecha(fecha_str):
     return fecha_str if fecha_str and len(fecha_str) == 10 else time.strftime("%Y-%m-%d")
 
 def optimizar_imagen(imagen_bytes):
-    img = Image.open(io.BytesIO(imagen_bytes))
-    if img.width > 1024 or img.height > 1024:
-        img.thumbnail((1024, 1024))
-    return img
+    """Achica la imagen si es muy grande, devuelve bytes"""
+    try:
+        img = Image.open(io.BytesIO(imagen_bytes))
+        if img.width > 1024 or img.height > 1024:
+            img.thumbnail((1024, 1024))
+        # Convertir de vuelta a bytes para enviar a Gemini
+        img_byte_arr = io.BytesIO()
+        # Mantenemos el formato original o usamos JPEG por defecto
+        fmt = img.format if img.format else 'JPEG'
+        img.save(img_byte_arr, format=fmt)
+        return img_byte_arr.getvalue()
+    except:
+        return imagen_bytes # Si falla, devuelve original
 
 RUBROS_VALIDOS = """
 - Almacén
@@ -78,21 +87,24 @@ RUBROS_VALIDOS = """
 - Otros
 """
 
-def procesar_ticket_ia(lista_imagenes_pil):
+def procesar_lote_ia(lista_archivos):
+    """
+    Recibe una lista de diccionarios: [{'bytes': b'...', 'mime': 'image/jpeg'}, ...]
+    """
     contenidos = []
     
     prompt = f"""
-    Analiza estas imágenes (un solo ticket).
+    Analiza estos archivos (Imágenes o PDF) que son UN SOLO TICKET/FACTURA.
     
-    MISIÓN: Extraer CÓDIGO DE BARRAS (EAN).
-    - Busca números de 13 dígitos (empiezan con 779 generalmente) debajo del nombre.
-    - Campo: "codigo_barras".
+    MISIÓN: Extraer datos y CÓDIGO DE BARRAS (EAN/GTIN) si existe.
+    - EAN: 13 dígitos (ej: 779...), campo "codigo_barras".
     
-    1. Supermercado y Sucursal.
+    1. Comercio y Sucursal.
     2. Total Pagado.
-    3. LISTA COMPLETA: Nombre, Cantidad, Precio Unitario, Rubro, Código.
+    3. LISTA DE PRODUCTOS: Nombre, Cantidad, Precio Unitario, Rubro, Código.
     
-    Rubros: {RUBROS_VALIDOS}.
+    Rubros permitidos: {RUBROS_VALIDOS}.
+    Si es remedio -> "Farmacia".
     
     JSON: {{
         'supermercado': 'str', 
@@ -104,7 +116,14 @@ def procesar_ticket_ia(lista_imagenes_pil):
     }}
     """
     contenidos.append(prompt)
-    for img in lista_imagenes_pil: contenidos.append(img)
+    
+    # Agregamos cada archivo como un Part de Gemini
+    for archivo in lista_archivos:
+        part = types.Part.from_bytes(
+            data=archivo['bytes'],
+            mime_type=archivo['mime']
+        )
+        contenidos.append(part)
     
     response = client.models.generate_content(
         model=MODELO_IA,
@@ -114,7 +133,6 @@ def procesar_ticket_ia(lista_imagenes_pil):
     return json.loads(response.text)
 
 def guardar_ticket(data, user_id):
-    # 1. Buscar/Crear Supermercado
     nombre_super = data.get('supermercado', 'Desconocido').upper()
     res_super = supabase.table('supermercados').select('id').ilike('nombre', nombre_super).execute()
     if res_super.data: super_id = res_super.data[0]['id']
@@ -122,11 +140,10 @@ def guardar_ticket(data, user_id):
         res_new = supabase.table('supermercados').insert({"nombre": nombre_super}).execute()
         super_id = res_new.data[0]['id']
 
-    # --- LÓGICA DE REEMPLAZO (Tú idea genial) ---
+    # Upsert Lógico
     fecha_limpia = limpiar_fecha(data.get('fecha'))
     monto_limpio = limpiar_numero(data.get('total_pagado'))
     
-    # Buscamos si ya existe este ticket exacto
     ticket_existente = supabase.table('tickets').select('id')\
         .eq('user_id', user_id)\
         .eq('supermercado_id', super_id)\
@@ -136,33 +153,28 @@ def guardar_ticket(data, user_id):
     
     status_msg = ""
     if ticket_existente.data:
-        # ¡Existe! Lo borramos para reemplazarlo por la versión mejorada
         id_viejo = ticket_existente.data[0]['id']
         supabase.table('tickets').delete().eq('id', id_viejo).execute()
         status_msg = "(Actualizado ♻️)"
-        print(f"♻️ Ticket duplicado encontrado y eliminado: {id_viejo}")
 
-    # 2. Insertar Ticket Nuevo
     ticket_data = {
         "user_id": user_id,
         "supermercado_id": super_id,
         "fecha": fecha_limpia,
         "hora": time.strftime("%H:%M:%S"),
         "monto_total": monto_limpio,
-        "imagen_url": "whatsapp_bot_v6"
+        "imagen_url": "whatsapp_bot_multi"
     }
     res_ticket = supabase.table('tickets').insert(ticket_data).execute()
     ticket_id = res_ticket.data[0]['id']
 
-    # 3. Insertar Items
-    items_brutos = data.get('items', [])
     items_db = []
-    for item in items_brutos:
+    for item in data.get('items', []):
         items_db.append({
             "ticket_id": ticket_id,
-            "nombre_producto": item.get('nombre', 'Sin Nombre'),
-            "cantidad": item.get('cantidad', 1),
-            "precio_neto_unitario": item.get('precio_neto_final', 0),
+            "nombre_producto": item.get('nombre', 'Item'),
+            "cantidad": limpiar_numero(item.get('cantidad', 1)),
+            "precio_neto_unitario": limpiar_numero(item.get('precio_neto_final', 0)),
             "unidad_medida": "Un",
             "rubro": item.get('rubro'),
             "marca": item.get('marca'),
@@ -192,7 +204,7 @@ def whatsapp_webhook():
         num_media = int(request.form.get('NumMedia', 0)) 
         telefono_usuario = sender.replace("whatsapp:", "")
         
-        print(f"1. Mensaje de {telefono_usuario}. Fotos: {num_media}")
+        print(f"1. Mensaje de {telefono_usuario}. Archivos: {num_media}")
 
         res = supabase.table('perfiles').select("id").eq('telefono', telefono_usuario).execute()
         if not res.data:
@@ -202,18 +214,31 @@ def whatsapp_webhook():
         user_id = res.data[0]['id']
 
         if num_media > 0:
-            print(f"2. Descargando {num_media} imágenes...")
-            lista_imagenes = []
+            print(f"2. Descargando {num_media} archivos...")
+            archivos_procesados = []
             
             for i in range(num_media):
                 url = request.form.get(f'MediaUrl{i}')
+                content_type = request.form.get(f'MediaContentType{i}')
+                
                 r = requests.get(url, auth=(TWILIO_SID, TWILIO_TOKEN))
                 if r.status_code == 200:
-                    lista_imagenes.append(optimizar_imagen(r.content))
+                    datos_archivo = r.content
+                    
+                    # SI ES IMAGEN -> OPTIMIZAR
+                    if "image" in content_type:
+                        datos_archivo = optimizar_imagen(datos_archivo)
+                    
+                    # SI ES PDF -> PASAR DIRECTO (Gemini lo lee nativo)
+                    
+                    archivos_procesados.append({
+                        'bytes': datos_archivo,
+                        'mime': content_type
+                    })
             
-            if lista_imagenes:
-                print("3. Enviando lote a IA...")
-                datos = procesar_ticket_ia(lista_imagenes)
+            if archivos_procesados:
+                print("3. Enviando a IA...")
+                datos = procesar_lote_ia(archivos_procesados)
                 
                 if datos:
                     print("4. Guardando...")
@@ -223,13 +248,13 @@ def whatsapp_webhook():
                     if cant > 0:
                         enviar_whatsapp(telefono_usuario, f"✅ *Guardado {status}*\n📍 {datos.get('supermercado')}\n💰 ${total}\n🛒 {cant} items")
                     else:
-                        enviar_whatsapp(telefono_usuario, "⚠️ Ticket vacío.")
+                        enviar_whatsapp(telefono_usuario, "⚠️ Archivo leído pero sin items.")
                 else:
-                    enviar_whatsapp(telefono_usuario, "❌ La IA no pudo leer.")
+                    enviar_whatsapp(telefono_usuario, "❌ La IA no pudo leer el archivo.")
             else:
-                enviar_whatsapp(telefono_usuario, "❌ Error descarga.")
+                enviar_whatsapp(telefono_usuario, "❌ Error descargando archivos.")
         else:
-            enviar_whatsapp(telefono_usuario, "📸 Envíame fotos del ticket.")
+            enviar_whatsapp(telefono_usuario, "📸 Envíame foto o PDF.")
 
     except Exception as e:
         print(f"🔴 ERROR: {e}")
