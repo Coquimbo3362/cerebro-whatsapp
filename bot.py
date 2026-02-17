@@ -13,6 +13,7 @@ from google import genai
 from google.genai import types
 from PIL import Image
 import io
+import gc # Importamos el recolector de basura para liberar memoria
 
 # --- CONFIGURACIÓN ---
 load_dotenv()
@@ -45,19 +46,33 @@ def limpiar_fecha(fecha_str):
     return fecha_str if fecha_str and len(fecha_str) == 10 else time.strftime("%Y-%m-%d")
 
 def optimizar_imagen(imagen_bytes):
-    """Achica la imagen si es muy grande, devuelve bytes"""
+    """
+    Versión 'Low Memory' para evitar crasheos en Render Free.
+    Reduce drásticamente el tamaño en memoria.
+    """
     try:
+        # Abrimos la imagen
         img = Image.open(io.BytesIO(imagen_bytes))
-        if img.width > 1024 or img.height > 1024:
-            img.thumbnail((1024, 1024))
-        # Convertir de vuelta a bytes para enviar a Gemini
+        
+        # Convertimos a RGB (por si es PNG con transparencia que gasta memoria)
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+            
+        # Redimensionamos agresivamente a max 800px (suficiente para leer texto)
+        if img.width > 800 or img.height > 800:
+            img.thumbnail((800, 800))
+            
+        # Guardamos comprimida en memoria
         img_byte_arr = io.BytesIO()
-        # Mantenemos el formato original o usamos JPEG por defecto
-        fmt = img.format if img.format else 'JPEG'
-        img.save(img_byte_arr, format=fmt)
+        img.save(img_byte_arr, format='JPEG', quality=60, optimize=True)
+        
+        # Liberamos la imagen original de la memoria
+        del img
+        gc.collect()
+        
         return img_byte_arr.getvalue()
     except:
-        return imagen_bytes # Si falla, devuelve original
+        return imagen_bytes
 
 RUBROS_VALIDOS = """
 - Almacén
@@ -88,22 +103,17 @@ RUBROS_VALIDOS = """
 """
 
 def procesar_lote_ia(lista_archivos):
-    """
-    Recibe una lista de diccionarios: [{'bytes': b'...', 'mime': 'image/jpeg'}, ...]
-    """
     contenidos = []
     
     prompt = f"""
-    Analiza estos archivos (Imágenes o PDF) que son UN SOLO TICKET/FACTURA.
-    
-    MISIÓN: Extraer datos y CÓDIGO DE BARRAS (EAN/GTIN) si existe.
-    - EAN: 13 dígitos (ej: 779...), campo "codigo_barras".
+    Analiza este ticket/factura.
+    MISIÓN: Extraer datos y CÓDIGO DE BARRAS (EAN 13 dígitos) en 'codigo_barras' si existe.
     
     1. Comercio y Sucursal.
     2. Total Pagado.
-    3. LISTA DE PRODUCTOS: Nombre, Cantidad, Precio Unitario, Rubro, Código.
+    3. LISTA PRODUCTOS: Nombre, Cantidad, Precio Unitario, Rubro, Código.
     
-    Rubros permitidos: {RUBROS_VALIDOS}.
+    Rubros: {RUBROS_VALIDOS}.
     Si es remedio -> "Farmacia".
     
     JSON: {{
@@ -117,13 +127,16 @@ def procesar_lote_ia(lista_archivos):
     """
     contenidos.append(prompt)
     
-    # Agregamos cada archivo como un Part de Gemini
     for archivo in lista_archivos:
         part = types.Part.from_bytes(
             data=archivo['bytes'],
             mime_type=archivo['mime']
         )
         contenidos.append(part)
+    
+    # Liberamos memoria de la lista original
+    del lista_archivos
+    gc.collect()
     
     response = client.models.generate_content(
         model=MODELO_IA,
@@ -163,7 +176,7 @@ def guardar_ticket(data, user_id):
         "fecha": fecha_limpia,
         "hora": time.strftime("%H:%M:%S"),
         "monto_total": monto_limpio,
-        "imagen_url": "whatsapp_bot_multi"
+        "imagen_url": "whatsapp_bot_optimized"
     }
     res_ticket = supabase.table('tickets').insert(ticket_data).execute()
     ticket_id = res_ticket.data[0]['id']
@@ -225,17 +238,19 @@ def whatsapp_webhook():
                 if r.status_code == 200:
                     datos_archivo = r.content
                     
-                    # SI ES IMAGEN -> OPTIMIZAR
+                    # SI ES IMAGEN -> OPTIMIZAR (Aquí aplicamos la dieta)
                     if "image" in content_type:
                         datos_archivo = optimizar_imagen(datos_archivo)
-                    
-                    # SI ES PDF -> PASAR DIRECTO (Gemini lo lee nativo)
                     
                     archivos_procesados.append({
                         'bytes': datos_archivo,
                         'mime': content_type
                     })
-            
+                    
+                    # Liberamos memoria de la respuesta original
+                    del r
+                    gc.collect()
+
             if archivos_procesados:
                 print("3. Enviando a IA...")
                 datos = procesar_lote_ia(archivos_procesados)
