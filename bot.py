@@ -34,7 +34,7 @@ try:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     client = genai.Client(api_key=GOOGLE_KEY)
     twilio_client = TwilioClient(TWILIO_SID, TWILIO_TOKEN) 
-    MODELO_IA = 'gemini-2.5-flash'
+    MODELO_IA = 'gemini-2.0-flash'
 except Exception as e:
     print(f"Error iniciando clientes: {e}")
 
